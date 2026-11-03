@@ -84,6 +84,44 @@ function createServer() {
           u.pushLog({ kind: 'admin', method: 'POST', path: '/admin/keys', model: '', provider: updated.join(','), failover: '', status: 200, ms: Date.now() - started });
           return u.sendJson(res, 200, { ok: true, updated });
         }
+        if (url.pathname === '/admin/custom' && req.method === 'POST') {
+          const raw = await u.readBody(req);
+          let body;
+          try { body = JSON.parse(raw); } catch (e) {
+            return u.sendJson(res, 400, { error: { message: '请求体不是合法 JSON', type: 'invalid_request', code: 'bad_json' } });
+          }
+          if (body.action === 'add') {
+            if (!body.provider || typeof body.provider !== 'object' || Array.isArray(body.provider)) {
+              return u.sendJson(res, 400, { error: { message: '缺 provider 对象', type: 'invalid_request', code: 'missing_provider' } });
+            }
+            const r = providers.addCustom(body.provider);
+            if (!r.ok) return u.sendJson(res, 400, { error: { message: r.error, type: 'invalid_request', code: 'bad_custom_provider' } });
+            try {
+              admin.saveCustomFile();
+            } catch (e) {
+              providers.deleteCustom(body.provider.id); // 回滚内存
+              return u.sendJson(res, 500, { error: { message: `写自定义源文件失败：${e.message}`, type: 'server_error', code: 'custom_write_failed' } });
+            }
+            u.pushLog({ kind: 'admin', method: 'POST', path: '/admin/custom', model: '', provider: body.provider.id, failover: '', status: 200, ms: Date.now() - started });
+            return u.sendJson(res, 200, { ok: true, provider: body.provider.id });
+          }
+          if (body.action === 'delete') {
+            if (typeof body.id !== 'string') {
+              return u.sendJson(res, 400, { error: { message: '缺 id', type: 'invalid_request', code: 'missing_id' } });
+            }
+            const r = providers.deleteCustom(body.id);
+            if (!r.ok) return u.sendJson(res, 400, { error: { message: r.error, type: 'invalid_request', code: 'bad_custom_provider' } });
+            try {
+              admin.saveCustomFile();
+            } catch (e) {
+              if (r.removed) providers.addCustom(r.removed); // 回滚内存（多余字段会丢，路由关键字段都在）
+              return u.sendJson(res, 500, { error: { message: `写自定义源文件失败：${e.message}`, type: 'server_error', code: 'custom_write_failed' } });
+            }
+            u.pushLog({ kind: 'admin', method: 'POST', path: '/admin/custom', model: '', provider: body.id, failover: '', status: 200, ms: Date.now() - started });
+            return u.sendJson(res, 200, { ok: true, deleted: body.id });
+          }
+          return u.sendJson(res, 400, { error: { message: 'action 须是 add 或 delete', type: 'invalid_request', code: 'bad_action' } });
+        }
         if (url.pathname === '/admin/test' && req.method === 'POST') {
           const raw = await u.readBody(req);
           let body;

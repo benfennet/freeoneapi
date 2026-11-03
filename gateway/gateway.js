@@ -28,6 +28,14 @@ const server = require('./server');
     console.log(`[freeoneapi] 本地网关已启动：http://${config.HOST}:${config.PORT}/v1`);
     console.log(`[freeoneapi] 管理页：http://${config.HOST}:${config.PORT}/ui`);
     console.log(`[freeoneapi] 库：${providers.getProviders().length} 家源，${providers.getModelMap().size} 个静态免费模型`);
+    const customRaw = providers.getCustomRaw();
+    if (customRaw.length > 0) {
+      const customErrs = providers.getCustomErrors();
+      console.log(`[freeoneapi] 自定义源：${customRaw.length - customErrs.length} 家有效，${customErrs.length} 家不合格（管理页看原因）`);
+    }
+    if (providers.getCustomLoadError()) {
+      console.log(`[freeoneapi] 自定义源文件读取失败：${providers.getCustomLoadError()}`);
+    }
     if (keyed.length > 0) {
       console.log(`[freeoneapi] 已配 key 的源：${keyed.join('、')}（只显示源名，不显示 key）`);
     } else {

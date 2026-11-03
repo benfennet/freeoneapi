@@ -1,4 +1,4 @@
-// freeoneapi 管理模块：源状态、填 key（持久化）、单源测试。
+// freeoneapi 管理模块：源状态、填 key（持久化）、单源测试、自定义源增删。
 // key 只写不读，任何接口不返回 key 明文。
 'use strict';
 
@@ -37,7 +37,38 @@ function saveEnvKeys() {
   config.loadedEnvFile = file;
 }
 
+// 自定义源文件原样写回（美化缩进，手写可读），原子写
+function saveCustomFile() {
+  const file = providers.getCustomFilePath();
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(providers.getCustomRaw(), null, 2) + '\n', 'utf8');
+  fs.renameSync(tmp, file);
+}
+
 function adminStatus(startedAt) {
+  const library = providers.getProviders().map((p) => ({
+    id: p.id,
+    name: p.name || p.id,
+    hasKey: !!config.KEYS[p.id],
+    models: Array.isArray(p.free_models) ? p.free_models : 'dynamic',
+    key_url: p.key_url || '',
+    custom: false,
+    error: '',
+  }));
+  const errors = providers.getCustomErrors();
+  const errByIndex = new Map(errors.map((e) => [e.index, e.error]));
+  const custom = providers.getCustomRaw().map((p, i) => {
+    const err = errByIndex.get(i) || '';
+    return {
+      id: typeof p.id === 'string' ? p.id : '',
+      name: typeof p.name === 'string' ? p.name : '',
+      hasKey: typeof p.id === 'string' ? !!config.KEYS[p.id] : false,
+      models: err ? [] : (Array.isArray(p.free_models) ? p.free_models : []),
+      key_url: typeof p.key_url === 'string' ? p.key_url : '',
+      custom: true,
+      error: err,
+    };
+  });
   return {
     service: 'freeoneapi-local',
     version: config.VERSION,
@@ -46,13 +77,8 @@ function adminStatus(startedAt) {
     startedAt,
     gatewayAuth: !!config.GATEWAY_KEY,
     models: providers.getModelMap().size,
-    providers: providers.getProviders().map((p) => ({
-      id: p.id,
-      name: p.name || p.id,
-      hasKey: !!config.KEYS[p.id],
-      models: Array.isArray(p.free_models) ? p.free_models : 'dynamic',
-      key_url: p.key_url || '',
-    })),
+    customLoadError: providers.getCustomLoadError() || '',
+    providers: [...library, ...custom],
   };
 }
 
@@ -61,7 +87,11 @@ async function handleAdminTest(bodyJson) {
   const providerId = bodyJson.provider;
   const model = bodyJson.model;
   const provider = providers.getProvider(providerId);
-  if (!provider) return { status: 400, body: { error: { message: `未知源 ${providerId}`, type: 'invalid_request', code: 'unknown_provider' } } };
+  if (!provider) {
+    const customErr = providers.getCustomErrorById(providerId);
+    if (customErr) return { status: 400, body: { error: { message: `该源配置有误：${customErr}`, type: 'invalid_request', code: 'bad_custom_provider' } } };
+    return { status: 400, body: { error: { message: `未知源 ${providerId}`, type: 'invalid_request', code: 'unknown_provider' } } };
+  }
   if (!config.KEYS[providerId]) return { status: 401, body: { error: { message: `源 ${providerId} 没配 key`, type: 'auth_error', code: 'no_key_for_provider' } } };
   if (!model || typeof model !== 'string') return { status: 400, body: { error: { message: '缺 model 字段', type: 'invalid_request', code: 'missing_model' } } };
   if (Array.isArray(provider.free_models) && !provider.free_models.includes(model)) {
@@ -93,4 +123,4 @@ async function handleAdminTest(bodyJson) {
   }
 }
 
-module.exports = { saveEnvKeys, adminStatus, handleAdminTest };
+module.exports = { saveEnvKeys, saveCustomFile, adminStatus, handleAdminTest };
