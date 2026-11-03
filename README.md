@@ -1,8 +1,10 @@
 # freeoneapi
 
-One API 的免费版：只走免费源的统一 API。项目包含两部分：免费源目录（本仓 `providers.json`）和用户自部署网关（后做）。
+One API 的免费版：只走免费源的统一 API。项目包含两部分：免费源目录（本仓 `providers.json`）和本地网关（`gateway/`，单文件 Node，零依赖）。
 
-与 One API 无关、独立实现。key 始终是用户自己的，网关部署在用户自己的地方。
+与 One API 无关、独立实现。key 始终是用户自己的，网关只跑在用户自己的电脑上。
+
+本地网关用法见 `gateway/README.md`，设计见 `DESIGN.md`。
 
 长期免费层大模型接口目录，给进阶用户（比如穷学生）用的免费 API 目录。
 

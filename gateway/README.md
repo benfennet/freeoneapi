@@ -1,0 +1,62 @@
+# freeoneapi 本地网关
+
+单文件，零依赖，Node 18+。在自己电脑上跑，得到本机 baseUrl，配进 opencode、Cherry Studio 就能用。
+
+与 One API 无关、独立实现。只走免费源，绝不切付费。
+
+## 部署（四步）
+
+1. 装 Node 18+（`node --version` 能看到版本号就行）。
+2. 下载本目录的 `gateway.js`，同目录建 `.env`（照着 `.env.example` 抄，填自己的 key）。
+3. `node gateway.js`，看到“本地网关已启动”就是跑起来了。
+4. 客户端配 baseUrl：`http://127.0.0.1:8080/v1`。
+
+用之前先把网关跑起来，电脑关了就没了，个人用够了。
+
+## 配进 opencode
+
+`opencode.json` 里加自定义 provider：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "freeoneapi": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "任意占位（本机监听不鉴权）"
+      },
+      "models": {
+        "openai/gpt-oss-120b": { "name": "gpt-oss-120b（Groq 免费）" },
+        "glm-4.7-flash": { "name": "GLM 4.7 Flash（智谱免费）" }
+      }
+    }
+  }
+}
+```
+
+模型 id 从库里看：静态免费模型 `GET http://127.0.0.1:8080/v1/models`；动态源的模型（如硅基流动）在 `.env` 里用 `MODEL_ROUTES` 指定。
+
+## key 从哪来
+
+照着库里的 5 家免费源去申请（见 `../providers.json` 的 `key_url` 和 `key_steps`）。国内先拿硅基流动和智谱（不用网络），国外拿 Gemini、Groq、OpenRouter。多拿几家，自动切的池子就越大。
+
+## 日常行为
+
+- 某家额度用完（429）或挂了（5xx、超时），自动切下一家免费源，用户多等几秒，不断线。
+- 响应头标明实际是谁答的：`x-freeoneapi-provider`、`x-freeoneapi-model`、`x-freeoneapi-failover`。
+- 流式：还没输出就失败，换家重发整条；已经输出才失败，明示截断加错误，不会静默截断成完整回答。
+- 免费额度全用完：返回明确错误，列出每家失败的原因，等第二天重置，或再加新的免费源（改 .env，重启）。
+
+## 安全
+
+- key 只进本地 `.env`，绝不进代码和仓库；日志不记 key、不记请求体。
+- 默认只绑 127.0.0.1，本机隔离就是保护，不用网关密钥。
+- 监听非本机地址时必须设 `GATEWAY_KEY`，否则网关拒绝启动。
+- 网关不对浏览器开放，浏览器聊天走直连各家，不走网关。
+
+## 更新
+
+- 库更新：启动时自动拉最新库，不用重新部署网关。
+- 网关代码更新：重新下载 `gateway.js`，重启。
