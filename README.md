@@ -15,7 +15,25 @@
 
 ## 数据文件
 
-- `providers.json`：免费源列表（首批采集中，调研结果回来后写入）。
+- `providers.json`：免费源列表（v1，2026-11-03，官方文档核实版）。
+
+## v1 入库（5 家）
+
+- 国外：Google AI Studio（Gemini）、Groq、OpenRouter（:free 模型，名单动态过滤）
+- 国内：SiliconFlow 硅基流动、智谱 BigModel（GLM）
+
+## v1 未收录（原因）
+
+- Hugging Face Inference Providers：免费账号月度额度 2026-10-07 起为 None，无免费层。
+- Mistral La Plateforme：官方定价页对话模型全部标价，仅审核模型免费。
+- Together AI：官方定价页无免费层，需先购额度。
+- 阿里云百炼 DashScope：新人每模型 100 万 Token、90 天有效，是一次性试用金，不是长期免费层。
+- DeepSeek：无免费层，按量付费（短问答约 ¥0.003–0.01/问），便宜但不是免费，v1 不收。
+
+## 核实说明
+
+- v1 是官方文档核实版：免费层以各家官方定价/文档页为准；`base_url_verified` 为 false 的地址待核官方 quickstart，不写成已核实。
+- 实测（真正申请 key 并调通）为第二步；国内源的实名申请流程需本人手机/实名，待本人实测。
 
 ## 维护
 
