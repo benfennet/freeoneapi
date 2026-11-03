@@ -2,18 +2,22 @@
 // freeoneapi 本地网关：单文件，零依赖，Node 18+。
 // 用法：同目录建 .env（填 FREEONEAPI_KEYS），然后 node gateway.js。
 // 默认只绑 127.0.0.1:8080，只给本机用。key 只进 .env，绝不进代码和仓库。
+// 管理页：http://127.0.0.1:8080/ui（填 key、看状态、测试、看日志、复制 opencode 配置）。
 // 设计见 ../DESIGN.md。
 'use strict';
 
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const VERSION = 'v1';
 const DEFAULT_PROVIDERS_URL = 'https://benfennet.github.io/freeoneapi/providers.json';
 const BODY_LIMIT = 20 * 1024 * 1024; // 请求体上限 20MB，写代码的长提示也够
+const LOG_MAX = 100;
 
 // ---------- .env：只读，不覆盖真实环境变量；不展开变量；不记 key ----------
+let loadedEnvFile = null;
 function loadDotEnv() {
   const candidates = [
     path.join(__dirname, '.env'),
@@ -35,6 +39,7 @@ function loadDotEnv() {
         }
         if (key && !(key in process.env)) process.env[key] = val;
       }
+      loadedEnvFile = file;
       return file;
     } catch (e) {
       if (e.code !== 'ENOENT') throw e;
@@ -71,6 +76,16 @@ if (!LOCAL_HOSTS.has(HOST) && !GATEWAY_KEY) {
   console.error('[freeoneapi] 要么把 HOST 改回 127.0.0.1，要么在 .env 里设 GATEWAY_KEY。');
   process.exit(1);
 }
+
+// 管理 token：设了网关密钥就用它；没设（本机）就每启动随机一个，只印在控制台。
+const ADMIN_TOKEN = GATEWAY_KEY || crypto.randomBytes(16).toString('hex');
+const IS_LOCAL = LOCAL_HOSTS.has(HOST);
+const ALLOWED_ORIGINS = new Set([
+  `http://${HOST}:${PORT}`,
+  `http://127.0.0.1:${PORT}`,
+  `http://localhost:${PORT}`,
+]);
+let STARTED_AT = '';
 
 // ---------- 库：启动时拉一次，拉不到就报错退出，不带过期数据硬跑 ----------
 async function loadProviders() {
@@ -127,6 +142,14 @@ function modelsList() {
   return { object: 'list', data };
 }
 
+// ---------- 请求日志：只记元数据（时间、模型、源、状态、耗时），不记 key、不记请求体 ----------
+const LOGS = [];
+function pushLog(entry) {
+  entry.t = new Date().toISOString();
+  LOGS.push(entry);
+  while (LOGS.length > LOG_MAX) LOGS.shift();
+}
+
 // ---------- 工具 ----------
 function log(line) {
   console.log(`[${new Date().toISOString()}] ${line}`);
@@ -175,6 +198,17 @@ function checkAuth(req) {
   return h === `Bearer ${GATEWAY_KEY}`;
 }
 
+function checkAdmin(req) {
+  const h = req.headers.authorization || '';
+  return h === `Bearer ${ADMIN_TOKEN}`;
+}
+
+function checkOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // curl 等非浏览器请求无 Origin，靠 token 鉴权
+  return ALLOWED_ORIGINS.has(origin);
+}
+
 async function fetchWithTimeout(url, options, ms) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
@@ -203,7 +237,7 @@ function routeCandidates(model) {
 }
 
 // ---------- POST /v1/chat/completions ----------
-async function handleChat(req, res, rawBody) {
+async function handleChat(req, res, rawBody, ctx) {
   let body;
   try {
     body = JSON.parse(rawBody);
@@ -212,6 +246,7 @@ async function handleChat(req, res, rawBody) {
   }
   const model = body.model;
   const stream = body.stream === true;
+  ctx.model = typeof model === 'string' ? model : '';
   if (!model || typeof model !== 'string') {
     return sendJson(res, 400, { error: { message: '缺 model 字段', type: 'invalid_request', code: 'missing_model' } });
   }
@@ -225,7 +260,7 @@ async function handleChat(req, res, rawBody) {
   const withKey = routed.candidates.filter((id) => KEYS[id]);
   if (withKey.length === 0) {
     return sendJson(res, 401, { error: {
-      message: `模型 ${model} 对应的源（${routed.candidates.join('、')}）都没配 key。请在 .env 的 FREEONEAPI_KEYS 里加上对应源的 key，重启网关。`,
+      message: `模型 ${model} 对应的源（${routed.candidates.join('、')}）都没配 key。请在管理页（/ui）或 .env 的 FREEONEAPI_KEYS 里加上对应源的 key（管理页保存即生效，不用重启）。`,
       type: 'auth_error', code: 'no_key_for_provider',
     } });
   }
@@ -265,6 +300,8 @@ async function handleChat(req, res, rawBody) {
       'x-freeoneapi-model': model,
       'x-freeoneapi-failover': failover,
     };
+    ctx.provider = pid;
+    ctx.failover = failover;
     if (!stream) {
       const text = await upstream.text();
       res.writeHead(200, Object.assign({ 'content-type': 'application/json' }, meta));
@@ -328,6 +365,183 @@ async function handleChat(req, res, rawBody) {
   ));
 }
 
+// ---------- 管理页：key 持久化（只改 FREEONEAPI_KEYS 一行，其余行原样保留） ----------
+function saveEnvKeys() {
+  const file = loadedEnvFile || path.join(__dirname, '.env');
+  let text = '';
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
+  const newLine = 'FREEONEAPI_KEYS=' + JSON.stringify(KEYS);
+  const lines = text ? text.split(/\r?\n/) : [];
+  let found = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('FREEONEAPI_KEYS=')) {
+      lines[i] = newLine;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+    lines.push(newLine);
+  }
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, lines.join('\n') + '\n', 'utf8');
+  fs.renameSync(tmp, file);
+  loadedEnvFile = file;
+}
+
+function adminStatus() {
+  return {
+    service: 'freeoneapi-local',
+    version: VERSION,
+    host: HOST,
+    port: PORT,
+    startedAt: STARTED_AT,
+    gatewayAuth: !!GATEWAY_KEY,
+    models: MODEL_MAP.size,
+    providers: PROVIDERS.map((p) => ({
+      id: p.id,
+      name: p.name || p.id,
+      hasKey: !!KEYS[p.id],
+      models: Array.isArray(p.free_models) ? p.free_models : 'dynamic',
+      key_url: p.key_url || '',
+    })),
+  };
+}
+
+async function handleAdminTest(bodyJson) {
+  const providerId = bodyJson.provider;
+  const model = bodyJson.model;
+  const provider = PROVIDER_BY_ID.get(providerId);
+  if (!provider) return { status: 400, body: { error: { message: `未知源 ${providerId}`, type: 'invalid_request', code: 'unknown_provider' } } };
+  if (!KEYS[providerId]) return { status: 401, body: { error: { message: `源 ${providerId} 没配 key`, type: 'auth_error', code: 'no_key_for_provider' } } };
+  if (!model || typeof model !== 'string') return { status: 400, body: { error: { message: '缺 model 字段', type: 'invalid_request', code: 'missing_model' } } };
+  if (Array.isArray(provider.free_models) && !provider.free_models.includes(model)) {
+    return { status: 400, body: { error: { message: `模型 ${model} 不在源 ${providerId} 的免费清单里`, type: 'invalid_request', code: 'model_not_in_provider' } } };
+  }
+  const url = provider.base_url.replace(/\/$/, '') + '/chat/completions';
+  const headers = {
+    'content-type': 'application/json',
+    'authorization': `Bearer ${KEYS[providerId]}`,
+  };
+  if (providerId === 'openrouter') {
+    headers['http-referer'] = 'https://github.com/benfennet/freeoneapi';
+    headers['x-title'] = 'freeoneapi';
+  }
+  const started = Date.now();
+  try {
+    const upstream = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1, stream: false }),
+    }, TIMEOUT_MS);
+    const text = await upstream.text();
+    const ms = Date.now() - started;
+    if (upstream.ok) return { status: 200, body: { ok: true, provider: providerId, model, ms, status: upstream.status } };
+    return { status: 200, body: { ok: false, provider: providerId, model, ms, status: upstream.status, detail: text.slice(0, 300) } };
+  } catch (e) {
+    const ms = Date.now() - started;
+    return { status: 200, body: { ok: false, provider: providerId, model, ms, reason: e.message === 'timeout' ? `超时（${TIMEOUT_MS}ms）` : `网络错误：${e.message}` } };
+  }
+}
+
+// ---------- 管理页 HTML：单文件内联，无外部资源；JS 只用字符串拼接，不用模板字面量 ----------
+function adminPageHtml() {
+  const embedded = IS_LOCAL ? JSON.stringify(ADMIN_TOKEN) : '""';
+  const html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<title>freeoneapi 本地网关</title>'
+    + '<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;color:#222;line-height:1.6}'
+    + 'h1{font-size:20px}h2{font-size:16px;margin-top:28px;border-top:1px solid #ddd;padding-top:12px}'
+    + '.card{border:1px solid #ddd;border-radius:8px;padding:12px 14px;margin:10px 0}'
+    + '.small{font-size:13px;color:#666}.mono{font-family:monospace;word-break:break-all}'
+    + 'input[type=password],input[type=text]{width:100%;box-sizing:border-box;padding:7px 9px;margin:6px 0;border:1px solid #ccc;border-radius:6px}'
+    + 'button{padding:6px 14px;margin:4px 6px 4px 0;border:1px solid #bbb;border-radius:6px;background:#f5f5f5;cursor:pointer}'
+    + 'button:active{transform:translateY(1px)}pre{background:#f6f6f6;border:1px solid #ddd;border-radius:8px;padding:12px;overflow:auto;font-size:13px}'
+    + 'table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid #eee;padding:5px 6px;text-align:left}'
+    + '.ok{color:#1a7f37}.fail{color:#b3261e}</style></head><body>'
+    + '<h1>freeoneapi 本地网关</h1>'
+    + '<div id="status" class="small">加载中…</div>'
+    + '<div id="tokenRow" style="display:none" class="card"><div>输入网关密钥后才能操作管理接口。</div>'
+    + '<input type="password" id="tokenInput" placeholder="网关密钥">'
+    + '<button onclick="saveToken()">确认</button><span id="tokenMsg" class="small"></span></div>'
+    + '<h2>源与 key</h2><div id="providers"></div>'
+    + '<h2>请求记录</h2><button onclick="loadLogs()">刷新</button><span class="small">每 10 秒自动刷新，只记元数据，不记 key 与请求体。</span>'
+    + '<div id="logs"></div>'
+    + '<h2>opencode 配置片段</h2><div class="small">复制后粘贴进 opencode.json 的 provider 一节。动态源的模型需手动加。</div>'
+    + '<pre id="snippet"></pre><button onclick="copySnippet()">复制片段</button><span id="copyMsg" class="small"></span>'
+    + '<h2>说明</h2><div class="small">'
+    + 'key 只写不读，接口不返回 key 明文；保存即生效，不用重启。<br>'
+    + '端口与监听地址改 .env 后重启；MODEL_ROUTES 改 .env。<br>'
+    + '测试会消耗少量额度。</div>'
+    + '<script>'
+    + 'var TOKEN = ___ADMIN_TOKEN_JSON___;'
+    + 'var GATEWAY_AUTH = false;'
+    + 'function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/\x27/g,"&#39;");}'
+    + 'function headers(){return {"Content-Type":"application/json","Authorization":"Bearer "+TOKEN};}'
+    + 'function showTokenRow(msg){document.getElementById("tokenRow").style.display="block";'
+    + 'if(msg)document.getElementById("tokenMsg").textContent=msg;}'
+    + 'function saveToken(){var v=document.getElementById("tokenInput").value;if(!v)return;'
+    + 'TOKEN=v;try{sessionStorage.setItem("freeoneapi-admin-token",v);}catch(e){}loadStatus();}'
+    + 'function api(path,method,body){return fetch(path,{method:method||"GET",headers:headers(),'
+    + 'body:body?JSON.stringify(body):undefined}).then(function(r){if(r.status===401){showTokenRow("token 失效：本机请刷新页面，非本机请重新输入网关密钥。");'
+    + 'throw new Error("401");}return r.json();});}'
+    + 'function loadStatus(){if(!TOKEN){try{TOKEN=sessionStorage.getItem("freeoneapi-admin-token")||"";}catch(e){}}'
+    + 'if(!TOKEN){showTokenRow("");return;}'
+    + 'api("/admin/status").then(function(st){GATEWAY_AUTH=st.gatewayAuth;'
+    + 'var started=st.startedAt?new Date(st.startedAt).toLocaleString():"";'
+    + 'document.getElementById("status").textContent="地址 http://"+st.host+":"+st.port+"/v1 ｜ 源 "+st.providers.length+" 家 ｜ 静态模型 "+st.models+" 个 ｜ 启动于 "+started;'
+    + 'var html="";'
+    + 'st.providers.forEach(function(p){'
+    + 'var models=p.models==="dynamic"?"动态（测试时填模型 id）":p.models.join("、");'
+    + 'var keyLink=p.key_url?" <a href=\\""+esc(p.key_url)+"\\" target=\\"_blank\\" rel=\\"noopener\\">申请 key</a>":"";'
+    + 'var firstModel=p.models==="dynamic"?"":p.models[0]||"";'
+    + 'html+="<div class=\\"card\\"><b>"+esc(p.name)+"</b> <span class=\\"small\\">"+esc(p.id)+"</span> ｜ "+(p.hasKey?"已配 key":"未配 key")+keyLink'
+    + '+"<div class=\\"small\\">模型："+esc(models)+"</div>"'
+    + '+"<input type=\\"password\\" id=\\"key-"+esc(p.id)+"\\" placeholder=\\""+(p.hasKey?"已配，填入新 key 覆盖":"填入 key")+"\\">"'
+    + '+"<button onclick=\\"saveKey(\x27"+esc(p.id)+"\x27)\\">保存</button>"'
+    + '+(p.hasKey?"<button onclick=\\"clearKey(\x27"+esc(p.id)+"\x27)\\">清除</button>":"")'
+    + '+"<input type=\\"text\\" id=\\"test-"+esc(p.id)+"\\" value=\\""+esc(firstModel)+"\\" placeholder=\\"测试用模型 id\\">"'
+    + '+"<button onclick=\\"testProvider(\x27"+esc(p.id)+"\x27)\\">测试</button><span class=\\"small\\" id=\\"testmsg-"+esc(p.id)+"\\"></span></div>";});'
+    + 'document.getElementById("providers").innerHTML=html;'
+    + 'var snippetModels={};'
+    + 'st.providers.forEach(function(p){if(p.models!=="dynamic"){p.models.forEach(function(m){snippetModels[m]={name:m+"（"+p.id+"）"};});}});'
+    + 'var snippet={ $schema:"https://opencode.ai/config.json", provider:{ freeoneapi:{ npm:"@ai-sdk/openai-compatible",'
+    + 'options:{ baseURL:"http://"+st.host+":"+st.port+"/v1", apiKey:GATEWAY_AUTH?TOKEN:"任意占位（本机监听不鉴权）" },'
+    + 'models:snippetModels } } };'
+    + 'document.getElementById("snippet").textContent=JSON.stringify(snippet,null,2);'
+    + '}).catch(function(e){if(e.message!=="401")document.getElementById("status").textContent="状态加载失败："+e.message;});}'
+    + 'function saveKey(pid){var v=document.getElementById("key-"+pid).value;if(!v)return;'
+    + 'var keys={};keys[pid]=v;'
+    + 'api("/admin/keys","POST",{keys:keys}).then(function(){loadStatus();});}'
+    + 'function clearKey(pid){var keys={};keys[pid]="";'
+    + 'api("/admin/keys","POST",{keys:keys}).then(function(){loadStatus();});}'
+    + 'function testProvider(pid){var m=document.getElementById("test-"+pid).value;if(!m)return;'
+    + 'var el=document.getElementById("testmsg-"+pid);el.textContent="测试中…";'
+    + 'api("/admin/test","POST",{provider:pid,model:m}).then(function(r){'
+    + 'if(r.ok){el.textContent="通过（"+r.ms+"ms）";}'
+    + 'else if(r.error){el.textContent="失败："+r.error.message;}'
+    + 'else{el.textContent="失败："+(r.detail||r.reason||("HTTP "+r.status));}'
+    + 'el.className=r.ok?"small ok":"small fail";loadLogs();});}'
+    + 'function loadLogs(){api("/admin/logs").then(function(d){var html="<table><tr><th>时间</th><th>类型</th><th>模型</th><th>源</th><th>切换</th><th>状态</th><th>耗时</th></tr>";'
+    + 'd.logs.forEach(function(l){var t=l.t?new Date(l.t).toLocaleTimeString():"";'
+    + 'html+="<tr><td>"+esc(t)+"</td><td>"+esc(l.kind==="test"?"测试":l.kind==="admin"?"管理":"对话")+"</td><td class=\\"mono\\">"+esc(l.model||"")+"</td><td>"+esc(l.provider||"")+"</td><td>"+(l.failover==="true"?"是":"")+"</td><td>"+esc(l.status)+" </td><td>"+esc(l.ms)+"ms</td></tr>";});'
+    + 'html+="</table>";document.getElementById("logs").innerHTML=html;}).catch(function(){});}'
+    + 'function copySnippet(){var t=document.getElementById("snippet").textContent;'
+    + 'if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){document.getElementById("copyMsg").textContent="已复制";}).catch(function(){document.getElementById("copyMsg").textContent="复制失败，请手动复制";});}'
+    + 'else{var ta=document.createElement("textarea");ta.value=t;document.body.appendChild(ta);ta.select();'
+    + 'try{document.execCommand("copy");document.getElementById("copyMsg").textContent="已复制";}catch(e){document.getElementById("copyMsg").textContent="复制失败，请手动复制";}'
+    + 'document.body.removeChild(ta);}}'
+    + 'loadStatus();loadLogs();setInterval(loadLogs,10000);'
+    + '</script></body></html>';
+  // 用 replacer 函数，避免 token 里的 $ 被 replace 当成特殊序列
+  return html.replace('___ADMIN_TOKEN_JSON___', function () { return JSON.stringify(IS_LOCAL ? ADMIN_TOKEN : ''); });
+}
+
 // ---------- 服务器 ----------
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
@@ -341,17 +555,85 @@ const server = http.createServer(async (req, res) => {
         models: MODEL_MAP.size,
         host: HOST,
         port: PORT,
+        ui: '/ui',
       });
+    }
+    if (u.pathname === '/ui' && req.method === 'GET') {
+      const html = adminPageHtml();
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        'content-length': Buffer.byteLength(html),
+      });
+      res.end(html);
+      return;
     }
     if (u.pathname === '/v1/models' && req.method === 'GET') {
       return sendJson(res, 200, modelsList());
+    }
+    if (u.pathname.startsWith('/admin/')) {
+      if (!checkOrigin(req)) {
+        return sendJson(res, 403, { error: { message: '跨站请求被拒绝', type: 'auth_error', code: 'bad_origin' } });
+      }
+      if (!checkAdmin(req)) {
+        return sendJson(res, 401, { error: { message: '管理 token 不对或缺失', type: 'auth_error', code: 'bad_admin_token' } });
+      }
+      if (u.pathname === '/admin/status' && req.method === 'GET') {
+        return sendJson(res, 200, adminStatus());
+      }
+      if (u.pathname === '/admin/logs' && req.method === 'GET') {
+        return sendJson(res, 200, { logs: LOGS.slice().reverse() });
+      }
+      if (u.pathname === '/admin/keys' && req.method === 'POST') {
+        const raw = await readBody(req);
+        let body;
+        try { body = JSON.parse(raw); } catch (e) {
+          return sendJson(res, 400, { error: { message: '请求体不是合法 JSON', type: 'invalid_request', code: 'bad_json' } });
+        }
+        const keys = body.keys;
+        if (!keys || typeof keys !== 'object' || Array.isArray(keys)) {
+          return sendJson(res, 400, { error: { message: '缺 keys 对象', type: 'invalid_request', code: 'missing_keys' } });
+        }
+        const updated = [];
+        for (const pid of Object.keys(keys)) {
+          if (!PROVIDER_BY_ID.has(pid)) {
+            return sendJson(res, 400, { error: { message: `未知源 ${pid}`, type: 'invalid_request', code: 'unknown_provider' } });
+          }
+          if (typeof keys[pid] !== 'string') {
+            return sendJson(res, 400, { error: { message: `源 ${pid} 的 key 必须是字符串`, type: 'invalid_request', code: 'bad_key' } });
+          }
+          if (keys[pid] === '') delete KEYS[pid];
+          else KEYS[pid] = keys[pid];
+          updated.push(pid);
+        }
+        try {
+          saveEnvKeys();
+        } catch (e) {
+          return sendJson(res, 500, { error: { message: `写 .env 失败：${e.message}`, type: 'server_error', code: 'env_write_failed' } });
+        }
+        pushLog({ kind: 'admin', method: 'POST', path: '/admin/keys', model: '', provider: updated.join(','), failover: '', status: 200, ms: Date.now() - started });
+        return sendJson(res, 200, { ok: true, updated });
+      }
+      if (u.pathname === '/admin/test' && req.method === 'POST') {
+        const raw = await readBody(req);
+        let body;
+        try { body = JSON.parse(raw); } catch (e) {
+          return sendJson(res, 400, { error: { message: '请求体不是合法 JSON', type: 'invalid_request', code: 'bad_json' } });
+        }
+        const r = await handleAdminTest(body);
+        pushLog({ kind: 'test', method: 'POST', path: '/admin/test', model: body.model || '', provider: body.provider || '', failover: '', status: r.body.ok ? 200 : (r.body.status || r.status), ms: r.body.ms || 0 });
+        return sendJson(res, r.status, r.body);
+      }
+      return sendJson(res, 404, { error: { message: `未知管理路径 ${u.pathname}`, type: 'invalid_request', code: 'not_found' } });
     }
     if (u.pathname === '/v1/chat/completions' && req.method === 'POST') {
       if (!checkAuth(req)) {
         return sendJson(res, 401, { error: { message: '网关密钥不对或缺失（Authorization: Bearer <GATEWAY_KEY>）', type: 'auth_error', code: 'bad_gateway_key' } });
       }
       const rawBody = await readBody(req);
-      await handleChat(req, res, rawBody);
+      const ctx = { model: '', provider: '', failover: '' };
+      await handleChat(req, res, rawBody, ctx);
+      pushLog({ kind: 'chat', method: 'POST', path: '/v1/chat/completions', model: ctx.model, provider: ctx.provider, failover: ctx.failover, status: res.statusCode, ms: Date.now() - started });
       return;
     }
     if (u.pathname === '/v1/chat/completions') {
@@ -382,14 +664,19 @@ const server = http.createServer(async (req, res) => {
   MODEL_MAP = buildModelMap(PROVIDERS);
   const keyed = PROVIDERS.filter((p) => KEYS[p.id]).map((p) => p.id);
   server.listen(PORT, HOST, () => {
+    STARTED_AT = new Date().toISOString();
     console.log(`[freeoneapi] 本地网关已启动：http://${HOST}:${PORT}/v1`);
+    console.log(`[freeoneapi] 管理页：http://${HOST}:${PORT}/ui`);
     console.log(`[freeoneapi] 库：${PROVIDERS.length} 家源，${MODEL_MAP.size} 个静态免费模型`);
     if (keyed.length > 0) {
       console.log(`[freeoneapi] 已配 key 的源：${keyed.join('、')}（只显示源名，不显示 key）`);
     } else {
-      console.log('[freeoneapi] 未配任何 key：先用 GET /v1/models 看模型，配好 key（.env 的 FREEONEAPI_KEYS）后重启。');
+      console.log('[freeoneapi] 未配任何 key：打开管理页填 key，或配好 key（.env 的 FREEONEAPI_KEYS）后重启。');
     }
     if (GATEWAY_KEY) console.log('[freeoneapi] 已启用网关密钥鉴权。');
-    else if (LOCAL_HOSTS.has(HOST)) console.log('[freeoneapi] 本机监听，未设网关密钥（本机隔离就是保护）。');
+    else if (LOCAL_HOSTS.has(HOST)) {
+      console.log('[freeoneapi] 本机监听，未设网关密钥（本机隔离就是保护）。');
+      console.log(`[freeoneapi] 管理页 token（仅本机，curl 管理接口时用）：${ADMIN_TOKEN}`);
+    }
   });
 })();

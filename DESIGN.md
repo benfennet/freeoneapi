@@ -56,6 +56,16 @@ Worker 端 2026-11-03 用户亲定砍掉，专注做好本地。
 - `GET /v1/models`：返回库里的免费模型。
 - `GET /`：网关信息（服务名、源数量、模型数量），不含 key。
 
+## 管理页
+
+- `GET /ui`：管理页（单文件内联，无外部资源，不缓存）。
+- `GET /admin/status`：源状态（已配 key 与否、模型清单、申请链接），不返回 key 明文。
+- `POST /admin/keys`：填 key 或清除，只改 .env 的 FREEONEAPI_KEYS 一行（原子写），内存即时生效，不用重启。
+- `POST /admin/test`：对单个源发最小请求验 key 通不通（消耗少量额度），不自动切。
+- `GET /admin/logs`：最近 100 条请求记录（时间、模型、源、切换、状态、耗时），不记 key 与请求体。
+- 鉴权：token 为 GATEWAY_KEY（设了时）或每启动随机一个（没设时，本机控制台打印）；本机打开管理页自动带 token，非本机需输入；跨站 Origin 拒绝；不发 CORS 头。
+- 不做：端口与监听地址、MODEL_ROUTES 的界面编辑（改 .env）。
+
 ## 部署
 
 本地版：`node gateway.js` + .env，默认只绑 127.0.0.1，随开随用。
